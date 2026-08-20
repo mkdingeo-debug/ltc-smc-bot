@@ -1,1 +1,1 @@
-worker: python ltc_smc_analyst.py --interval 15 --watch 15 --telegram
+worker: python ltc_smc_analyst.py --interval 60 --watch 60 --telegram
