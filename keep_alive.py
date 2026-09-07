@@ -71,6 +71,15 @@ def run_analyst_forever():
 
 
 class PingHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        # UptimeRobot y otros monitores a veces usan HEAD en vez de GET.
+        # Sin este método, el servidor respondía 501 Not Implemented y
+        # el monitor marcaba el bot como "caído" aunque siguiera
+        # funcionando por dentro.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+
     def do_GET(self):
         with _lock:
             restarts = _last_restart_count
