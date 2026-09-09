@@ -89,6 +89,19 @@ RSI_PERIOD = int(os.environ.get("RSI_PERIOD", "14"))
 VOLUME_LOOKBACK = int(os.environ.get("VOLUME_LOOKBACK", "20"))
 VOLUME_ZSCORE_THRESHOLD = float(os.environ.get("VOLUME_ZSCORE_THRESHOLD", "2.0"))
 
+# --- Parámetros de mejora de señal (nuevos) ---------------------------------
+# ATR: mide la volatilidad real de cada cripto (LTC no se mueve como BTC) y
+# se usa para el colchón de invalidación, en vez de un % fijo del rango que
+# trataba igual a todas las monedas de SYMBOLS.
+ATR_PERIOD = int(os.environ.get("ATR_PERIOD", "14"))
+ATR_BUFFER_MULT = float(os.environ.get("ATR_BUFFER_MULT", "0.5"))
+# Filtro de ruido en Order Blocks: descarta velas candidatas cuyo cuerpo es
+# demasiado pequeño frente al ATR (ruido, no huella institucional real).
+MIN_OB_BODY_ATR_MULT = float(os.environ.get("MIN_OB_BODY_ATR_MULT", "0.15"))
+# Un BOS/CHoCH con volumen real de Bybit por encima del promedio reciente es
+# una confirmación institucional más fiable que uno con volumen plano.
+BREAK_VOLUME_CONFIRM_MULT = float(os.environ.get("BREAK_VOLUME_CONFIRM_MULT", "1.2"))
+
 # Etiqueta opcional para distinguir despliegues del mismo código (ej. bot de
 # pruebas vs. bot de producción) sin tener que tocar el código cada vez.
 # Configúralo como variable de entorno DEPLOY_LABEL en Railway (ej. "PRUEBAS").
@@ -157,6 +170,7 @@ class StructureEvent:
     timestamp: pd.Timestamp
     price: float
     kind: Literal["BOS_bullish", "BOS_bearish", "CHoCH_bullish", "CHoCH_bearish"]
+    volume_confirmed: bool = True
 
 
 def find_swing_points(df: pd.DataFrame, order: int = SWING_ORDER) -> List[SwingPoint]:
@@ -176,7 +190,18 @@ def find_swing_points(df: pd.DataFrame, order: int = SWING_ORDER) -> List[SwingP
     return swings
 
 
-def detect_structure_events(swings: List[SwingPoint]) -> List[StructureEvent]:
+def _is_break_volume_confirmed(df: pd.DataFrame, index: int, lookback: int = VOLUME_LOOKBACK,
+                                mult: float = BREAK_VOLUME_CONFIRM_MULT) -> bool:
+    """Un BOS/CHoCH acompañado de volumen por encima del promedio reciente es
+    una confirmación institucional mucho más fiable que uno con volumen plano."""
+    start = max(0, index - lookback)
+    prior = df["volume"].iloc[start:index]
+    if prior.empty or prior.mean() == 0:
+        return True  # sin referencia suficiente, no penalizamos
+    return bool(df["volume"].iloc[index] >= prior.mean() * mult)
+
+
+def detect_structure_events(df: pd.DataFrame, swings: List[SwingPoint]) -> List[StructureEvent]:
     """
     BOS = continuación de la tendencia (rompe el último HH en alcista, o el
     último LL en bajista). CHoCH = posible cambio de tendencia (rompe el
@@ -191,19 +216,31 @@ def detect_structure_events(swings: List[SwingPoint]) -> List[StructureEvent]:
         if s.kind == "high":
             if last_high is not None:
                 if s.price > last_high.price:
+                    kind = None
                     if trend == "down":
-                        events.append(StructureEvent(s.index, s.timestamp, s.price, "CHoCH_bullish"))
+                        kind = "CHoCH_bullish"
                     elif trend == "up":
-                        events.append(StructureEvent(s.index, s.timestamp, s.price, "BOS_bullish"))
+                        kind = "BOS_bullish"
+                    if kind:
+                        events.append(StructureEvent(
+                            s.index, s.timestamp, s.price, kind,
+                            volume_confirmed=_is_break_volume_confirmed(df, s.index),
+                        ))
                     trend = "up"
             last_high = s
         else:
             if last_low is not None:
                 if s.price < last_low.price:
+                    kind = None
                     if trend == "up":
-                        events.append(StructureEvent(s.index, s.timestamp, s.price, "CHoCH_bearish"))
+                        kind = "CHoCH_bearish"
                     elif trend == "down":
-                        events.append(StructureEvent(s.index, s.timestamp, s.price, "BOS_bearish"))
+                        kind = "BOS_bearish"
+                    if kind:
+                        events.append(StructureEvent(
+                            s.index, s.timestamp, s.price, kind,
+                            volume_confirmed=_is_break_volume_confirmed(df, s.index),
+                        ))
                     trend = "down"
             last_low = s
 
@@ -226,7 +263,8 @@ class Zone:
     mitigated: bool = False
 
 
-def find_order_blocks(df: pd.DataFrame, events: List[StructureEvent], lookback: int = OB_LOOKBACK) -> List[Zone]:
+def find_order_blocks(df: pd.DataFrame, events: List[StructureEvent], lookback: int = OB_LOOKBACK,
+                       min_body: float = 0.0) -> List[Zone]:
     zones: List[Zone] = []
     for ev in events:
         start = max(0, ev.index - lookback)
@@ -236,7 +274,10 @@ def find_order_blocks(df: pd.DataFrame, events: List[StructureEvent], lookback: 
 
         bullish_event = "bullish" in ev.kind
         if bullish_event:
-            bearish_candles = segment[segment["close"] < segment["open"]]
+            bearish_candles = segment[
+                (segment["close"] < segment["open"])
+                & ((segment["open"] - segment["close"]) >= min_body)
+            ]
             if not bearish_candles.empty:
                 c = bearish_candles.iloc[-1]
                 zones.append(Zone(
@@ -245,7 +286,10 @@ def find_order_blocks(df: pd.DataFrame, events: List[StructureEvent], lookback: 
                     note=f"OB alcista previo a {ev.kind} ({ev.timestamp:%Y-%m-%d %H:%M})",
                 ))
         else:
-            bullish_candles = segment[segment["close"] > segment["open"]]
+            bullish_candles = segment[
+                (segment["close"] > segment["open"])
+                & ((segment["close"] - segment["open"]) >= min_body)
+            ]
             if not bullish_candles.empty:
                 c = bullish_candles.iloc[-1]
                 zones.append(Zone(
@@ -422,6 +466,23 @@ def calculate_rsi(df: pd.DataFrame, period: int = RSI_PERIOD) -> float:
     return float(rsi.iloc[-1]) if not rsi.empty and not pd.isna(rsi.iloc[-1]) else 50.0
 
 
+def calculate_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> float:
+    """Average True Range: mide la volatilidad real de cada cripto. LTC y
+    BTC no se mueven igual — el ATR adapta el colchón de invalidación a
+    cada símbolo de SYMBOLS en vez de usar un % fijo del rango para todos."""
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    true_range = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr = true_range.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    if not atr.empty and not pd.isna(atr.iloc[-1]):
+        return float(atr.iloc[-1])
+    return float((high - low).mean())
+
+
 # ==============================================================================
 # 6. ALERTA DE FLUJO DE CAPITAL (anomalía de volumen)
 # ==============================================================================
@@ -475,7 +536,7 @@ MAX_TP1_DISTANCE_MULT = 2.0  # TP1 no puede estar a más de N veces el tamaño d
 
 
 def compute_trade_plan(bias: str, price: float, pd_info: Optional[PremiumDiscount],
-                        zones: List[Zone]) -> Optional[TradePlan]:
+                        zones: List[Zone], atr: float) -> Optional[TradePlan]:
     if pd_info is None or bias not in ("alcista", "bajista"):
         return None
 
@@ -503,7 +564,10 @@ def compute_trade_plan(bias: str, price: float, pd_info: Optional[PremiumDiscoun
     entry_mid = (entry_low + entry_high) / 2
 
     rng = pd_info.range_high - pd_info.range_low
-    buffer = rng * 0.02  # pequeño colchón de invalidación
+    # Colchón de invalidación: el mayor entre el 2% del rango y el ATR
+    # ajustado — cada cripto de SYMBOLS recibe un margen acorde a su
+    # volatilidad real (LTC no se mueve como BTC).
+    buffer = max(rng * 0.02, atr * ATR_BUFFER_MULT)
     max_tp1_distance = rng * MAX_TP1_DISTANCE_MULT
 
     tp1_source = "límite del rango"
@@ -576,6 +640,7 @@ class SignalReport:
     invalidation_broken: bool
     rsi: float
     rsi_note: str
+    atr: float
     premium_discount: Optional[PremiumDiscount]
     extension_targets: Optional[Dict[float, float]]
     trade_plan: Optional[TradePlan]
@@ -620,6 +685,14 @@ def generate_signal(symbol: str, df: pd.DataFrame, events: List[StructureEvent],
     else:
         bias, confidence = "bajista", "media-alta" if last_event.kind.startswith("BOS") else "media"
 
+    # Degrada un nivel de confianza si el evento de estructura NO vino
+    # acompañado de volumen real de Bybit por encima del promedio — un
+    # BOS/CHoCH "silencioso" es una huella institucional menos convincente.
+    volume_note = ""
+    if last_event is not None and not last_event.volume_confirmed:
+        confidence = "media" if confidence == "media-alta" else "baja"
+        volume_note = " (sin confirmación de volumen — señal más débil de lo habitual)"
+
     swings_all = find_swing_points(df)
     invalidation = find_structural_invalidation(swings_all, last_event, bias)
 
@@ -639,6 +712,7 @@ def generate_signal(symbol: str, df: pd.DataFrame, events: List[StructureEvent],
         confidence = "muy baja — posible lectura obsoleta"
 
     rsi = calculate_rsi(df)
+    atr = calculate_atr(df)
     rsi_note = f"{rsi:.1f} (neutral)"
     if bias == "alcista" and not invalidation_broken:
         if rsi < 35:
@@ -650,6 +724,7 @@ def generate_signal(symbol: str, df: pd.DataFrame, events: List[StructureEvent],
             confidence, rsi_note = "alta", f"{rsi:.1f} (sobrecompra — refuerza el sesgo bajista)"
         elif rsi < 25:
             confidence, rsi_note = "baja", f"{rsi:.1f} (sobreventa — precaución, posible agotamiento)"
+    rsi_note += volume_note
 
     def zone_mid(z: Zone) -> float:
         return (z.top + z.bottom) / 2
@@ -674,7 +749,7 @@ def generate_signal(symbol: str, df: pd.DataFrame, events: List[StructureEvent],
     extension_targets = compute_extension_targets(pd_info) if pd_info else None
     # Si la lectura ya está obsoleta, no tiene sentido ofrecer un plan de
     # trading basado en un sesgo que probablemente ya cambió.
-    trade_plan = None if invalidation_broken else compute_trade_plan(bias, price, pd_info, zones)
+    trade_plan = None if invalidation_broken else compute_trade_plan(bias, price, pd_info, zones, atr)
     capital_flow_alert = detect_capital_flow_alert(df)
 
     return SignalReport(
@@ -683,7 +758,7 @@ def generate_signal(symbol: str, df: pd.DataFrame, events: List[StructureEvent],
         ob_zones=ob_zones[:3],
         fvg_zones=fvg_zones[:3], invalidation=invalidation,
         invalidation_broken=invalidation_broken,
-        rsi=rsi, rsi_note=rsi_note, premium_discount=pd_info,
+        rsi=rsi, rsi_note=rsi_note, atr=atr, premium_discount=pd_info,
         extension_targets=extension_targets,
         trade_plan=trade_plan, capital_flow_alert=capital_flow_alert,
     )
@@ -716,9 +791,11 @@ def render_template_report(report: SignalReport, interval: str) -> str:
     L.append("1) ESTRUCTURA Y SESGO")
     L.append(f"  Precio: {report.price:.4f} | Sesgo: {report.bias.upper()} | Confianza: {report.confidence}")
     L.append(f"  RSI({RSI_PERIOD}): {report.rsi_note}")
+    L.append(f"  ATR({ATR_PERIOD}): {report.atr:.4f} (volatilidad reciente, usada para la invalidación)")
     if report.last_event:
+        vol_tag = "✓ volumen" if report.last_event.volume_confirmed else "✗ sin volumen"
         L.append(f"  Último evento: {report.last_event.kind} en {report.last_event.price:.4f} "
-                  f"({report.last_event.timestamp:%m-%d %H:%M})")
+                  f"({report.last_event.timestamp:%m-%d %H:%M}) [{vol_tag}]")
         L.append(f"  Invalidación de esta lectura: {report.invalidation:.4f}")
     else:
         L.append("  Sin eventos de estructura claros todavía.")
@@ -805,6 +882,7 @@ def render_ai_report(report: SignalReport, interval: str) -> str:
         "bias": report.bias,
         "confidence": report.confidence,
         "rsi": report.rsi_note,
+        "atr": round(report.atr, 6),
         "capital_flow_alert": report.capital_flow_alert,
         "premium_discount": (
             {
@@ -881,11 +959,13 @@ def send_telegram_message(text: str) -> None:
 
 def analyze_symbol(symbol: str, interval: str, limit: int, use_ai: bool) -> str:
     df = fetch_klines(symbol=symbol, interval=interval, limit=limit)
+    atr = calculate_atr(df)
+    min_body = atr * MIN_OB_BODY_ATR_MULT
     swings = find_swing_points(df)
-    events = detect_structure_events(swings)
+    events = detect_structure_events(df, swings)
 
     zones = []
-    zones += find_order_blocks(df, events)
+    zones += find_order_blocks(df, events, min_body=min_body)
     tag_breaker_blocks(df, zones)
     zones += find_fair_value_gaps(df)
     zones += find_liquidity_pools(swings)
