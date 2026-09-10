@@ -117,6 +117,124 @@ OTE_LEVELS = (0.618, 0.705, 0.79)  # niveles institucionales de retroceso (ICT O
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 BOT_NAME = "cripto"  # debe coincidir con el check constraint de la columna "bot" en la tabla senales
+BOT_NAME_LEGIBLE = "Cripto"
+
+# ── Explicación hablada en español simple (para los clientes del canal) ────
+# Punto agregado a pedido del usuario: además del reporte técnico de
+# siempre, se manda un audio explicando la señal en lenguaje fácil, usando
+# gTTS (motor de voz gratuito de Google Translate — la voz suena algo
+# robótica, pero se entiende perfecto y no tiene ningún costo).
+CONFIANZA_SIMPLE = {
+    "alta": "está bastante seguro de esto",
+    "media-alta": "confía bastante, aunque no del todo",
+    "media": "tiene una confianza media, ni mucha ni poca",
+    "baja": "no está muy seguro, hay que tomarlo con pinzas",
+}
+
+
+def construir_explicacion_hablada(symbol: str, report) -> str:
+    tp = report.trade_plan
+    sube = report.bias == "alcista"
+    frases = [f"El bot de {BOT_NAME_LEGIBLE} piensa que el precio de {symbol} va a {'subir' if sube else 'bajar'}."]
+
+    confianza_texto = CONFIANZA_SIMPLE.get(report.confidence, "tiene una confianza media")
+    frases.append(f"El bot {confianza_texto}.")
+
+    pd_info = report.premium_discount
+    if pd_info:
+        zona_texto = (
+            "el precio está caro, comparado con lo último que se movió" if pd_info.zone == "premium"
+            else "el precio está barato, comparado con lo último que se movió"
+        )
+        frases.append(f"Ahora mismo, {zona_texto}.")
+
+    if report.liquidity_zones:
+        n = len(report.liquidity_zones)
+        frases.append(
+            f"Cerca hay {'una zona' if n == 1 else f'{n} zonas'} donde mucha gente tiene puestas sus "
+            f"apuestas, esto se llama liquidez. A veces el precio va justo ahí a sacudir esas apuestas "
+            f"antes de moverse de verdad, como una trampa antes del movimiento real."
+        )
+
+    if report.ob_zones:
+        n = len(report.ob_zones)
+        frases.append(
+            f"También el bot encontró {'una zona' if n == 1 else f'{n} zonas'} donde inversores grandes "
+            f"compraron o vendieron fuerte antes, esto se llama Order Block. Son como huellas en la arena, "
+            f"y el precio a veces vuelve a pisarlas antes de seguir su camino."
+        )
+
+    if tp:
+        frases.append(
+            f"Si alguien quisiera copiar esta idea: entraría cerca de {tp.entry_low:.4f}, pondría una "
+            f"alarma de emergencia, el stop loss, en {tp.stop_loss:.4f} para salir si el bot se equivoca, "
+            f"y la primera meta de ganancia sería {tp.take_profit_1:.4f}."
+        )
+
+    frases.append("Recordá: esto es un análisis técnico automático, no una promesa ni un consejo financiero.")
+    return " ".join(frases)
+
+
+def generar_audio_explicacion(texto: str) -> Optional[bytes]:
+    try:
+        from gtts import gTTS
+        import io
+        buf = io.BytesIO()
+        # tld="com.mx" da un acento de español latinoamericano, generalmente
+        # más neutro y claro que el acento de España que sale por defecto.
+        gTTS(text=texto, lang="es", tld="com.mx").write_to_fp(buf)
+        return buf.getvalue()
+    except Exception as exc:
+        print(f"[Aviso] No se pudo generar el audio de explicación: {exc}")
+        return None
+
+
+def subir_audio_supabase(audio_bytes: bytes, symbol: str) -> Optional[str]:
+    """Sube el audio a Supabase Storage y devuelve el link público, para que
+    el backoffice pueda reproducir la MISMA voz que se manda a Telegram (en
+    vez de depender de la voz que traiga cada celular)."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return None
+    nombre_archivo = f"{BOT_NAME}/{symbol.replace('/', '-')}-{int(time.time())}.mp3"
+    url = f"{SUPABASE_URL}/storage/v1/object/audios-senales/{nombre_archivo}"
+    try:
+        resp = requests.post(
+            url,
+            data=audio_bytes,
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "audio/mpeg",
+            },
+            timeout=30,
+        )
+        if resp.status_code >= 300:
+            print(f"[Aviso] No se pudo subir el audio de {symbol}: {resp.status_code} {resp.text}")
+            return None
+        return f"{SUPABASE_URL}/storage/v1/object/public/audios-senales/{nombre_archivo}"
+    except Exception as exc:
+        print(f"[Aviso] Error subiendo el audio de {symbol}: {exc}")
+        return None
+
+
+def enviar_audio_telegram(audio_bytes: bytes, symbol: str) -> None:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendAudio"
+    try:
+        resp = requests.post(
+            url,
+            data={"chat_id": chat_id, "caption": f"🔊 Explicación simple: {symbol}"},
+            files={"audio": (f"{symbol}.mp3", audio_bytes, "audio/mpeg")},
+            timeout=30,
+        )
+        result = resp.json()
+        if not result.get("ok"):
+            print(f"[Error Telegram audio] {result}")
+    except Exception as exc:
+        print(f"[Error enviando audio a Telegram] {exc}")
 
 
 def _construir_detalle(report) -> dict:
@@ -151,7 +269,7 @@ def _construir_detalle(report) -> dict:
     }
 
 
-def guardar_senal_supabase(symbol: str, report) -> None:
+def guardar_senal_supabase(symbol: str, report, audio_url: Optional[str] = None) -> None:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         return
     tp = report.trade_plan
@@ -173,6 +291,8 @@ def guardar_senal_supabase(symbol: str, report) -> None:
         "confianza": report.confidence,
         "detalle": _construir_detalle(report),
     }
+    if audio_url:
+        payload["audio_url"] = audio_url
     try:
         resp = requests.post(
             f"{SUPABASE_URL}/rest/v1/senales",
@@ -1064,7 +1184,17 @@ def run_once(symbols: List[str], interval: str, limit: int, use_ai: bool, use_te
             print(text)
             if use_telegram:
                 send_telegram_message(text)
-            guardar_senal_supabase(symbol, report)
+
+            audio_url = None
+            if report.trade_plan is not None:
+                texto_hablado = construir_explicacion_hablada(symbol, report)
+                audio = generar_audio_explicacion(texto_hablado)
+                if audio:
+                    if use_telegram:
+                        enviar_audio_telegram(audio, symbol)
+                    audio_url = subir_audio_supabase(audio, symbol)
+
+            guardar_senal_supabase(symbol, report, audio_url)
         except Exception as exc:
             print(f"[Error analizando {symbol}] {exc}")
 
