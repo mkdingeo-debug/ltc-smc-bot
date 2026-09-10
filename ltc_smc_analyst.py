@@ -119,6 +119,38 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").stri
 BOT_NAME = "cripto"  # debe coincidir con el check constraint de la columna "bot" en la tabla senales
 
 
+def _construir_detalle(report) -> dict:
+    """Arma un resumen en JSON de todo el análisis (no solo los números del
+    plan de trading), para que el backoffice pueda armar una explicación en
+    lenguaje simple más adelante, sin depender de leer el texto ya armado."""
+    pd_info = report.premium_discount
+    tp = report.trade_plan
+    return {
+        "rsi_note": report.rsi_note,
+        "confianza": report.confidence,
+        "alerta_flujo_capital": report.capital_flow_alert,
+        "invalidacion_rota": report.invalidation_broken,
+        "premium_discount": (
+            {"zona": pd_info.zone, "rango_bajo": pd_info.range_low, "rango_alto": pd_info.range_high}
+            if pd_info else None
+        ),
+        "liquidez": [z.note for z in (report.liquidity_zones or [])],
+        "order_blocks": [
+            {"tipo": z.kind, "bottom": z.bottom, "top": z.top, "nota": z.note}
+            for z in (report.ob_zones or [])
+        ],
+        "fvg": [{"tipo": z.kind, "bottom": z.bottom, "top": z.top} for z in (report.fvg_zones or [])],
+        "objetivos_extension": (
+            {str(k): v for k, v in report.extension_targets.items()} if report.extension_targets else None
+        ),
+        "plan": (
+            {
+                "rr1": tp.rr1, "rr2": tp.rr2, "rr3": tp.rr3, "fuente_tp1": tp.tp1_source,
+            } if tp else None
+        ),
+    }
+
+
 def guardar_senal_supabase(symbol: str, report) -> None:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         return
@@ -139,6 +171,7 @@ def guardar_senal_supabase(symbol: str, report) -> None:
         "tp2": tp.take_profit_2,
         "tp3": tp.take_profit_3,
         "confianza": report.confidence,
+        "detalle": _construir_detalle(report),
     }
     try:
         resp = requests.post(
