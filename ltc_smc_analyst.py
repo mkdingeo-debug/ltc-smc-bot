@@ -1028,6 +1028,17 @@ def generate_signal(symbol: str, df: pd.DataFrame, events: List[StructureEvent],
 def render_template_report(report: SignalReport, interval: str) -> str:
     L = []
     label_prefix = f"[{DEPLOY_LABEL}] " if DEPLOY_LABEL else ""
+    if report.trade_plan is not None:
+        if report.bias == "alcista":
+            L.append("🟢 LONG")
+            L.append("🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩")
+        else:
+            L.append("🔴 SHORT")
+            L.append("🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥🟥")
+    else:
+        L.append("⚪ SIN OPERACIÓN")
+        L.append("⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜⬜")
+    L.append("")
     L.append(f"═══ {label_prefix}RIDGECREST CRYPTO | NATHANIEL RIDGE | {report.symbol} | TF {interval} ═══")
     L.append(formatear_fecha_con_hora_local(report.generated_at))
     L.append("")
