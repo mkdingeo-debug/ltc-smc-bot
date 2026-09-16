@@ -382,12 +382,25 @@ esto es un escenario técnico automatizado, no asesoría financiera personalizad
 # 1. DESCARGA DE DATOS (Bybit v5 API pública)
 # ==============================================================================
 
+# Cabeceras de la petición: Bybit (vía Cloudflare) puede bloquear con 403 el
+# User-Agent por defecto de la librería "requests" (algo como
+# "python-requests/2.x"), que se identifica fácilmente como tráfico de bot.
+# Usamos un User-Agent de navegador normal para que la petición se vea como
+# la de cualquier persona navegando, no como un script automatizado.
+BYBIT_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+}
+
 
 def fetch_klines(symbol: str, interval: str = "60", limit: int = 300,
                   category: str = CATEGORY) -> pd.DataFrame:
     url = f"{BYBIT_BASE_URL}/v5/market/kline"
     params = {"category": category, "symbol": symbol, "interval": interval, "limit": limit}
-    resp = requests.get(url, params=params, timeout=15)
+    resp = requests.get(url, params=params, headers=BYBIT_REQUEST_HEADERS, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
