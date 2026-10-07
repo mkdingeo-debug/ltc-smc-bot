@@ -258,7 +258,7 @@ def enviar_audio_telegram(audio_bytes: bytes, symbol: str) -> None:
         else:
             print(f"[Audio] Enviado a Telegram OK (message_id {result['result']['message_id']}).")
     except Exception as exc:
-        print(f"[Error enviando audio a Telegram] {type(exc).__name__}: {exc}")
+        print(f"[Error enviando audio a Telegram] {type(exc).__name__}: {str(exc).replace(token, '***')}")
 
 
 def _construir_detalle(report) -> dict:
@@ -323,13 +323,58 @@ def enviar_latido() -> None:
         print(f"[Aviso] Error actualizando el latido: {exc}")
 
 
-def guardar_senal_supabase(symbol: str, report, audio_url: Optional[str] = None) -> None:
+def existe_senal_abierta(simbolo: str) -> bool:
+    """Antes de guardar una señal nueva, revisa si YA hay una señal de este
+    mismo símbolo (de este bot) que sigue abierta (sin resultado, o con
+    resultado 'en_curso'). Si la hay, no se guarda una nueva — esto evita
+    crear señales duplicadas cada vez que el análisis vuelve a dar el mismo
+    plan de trading porque el mercado no se movió lo suficiente entre una
+    corrida y la siguiente."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    try:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/senales",
+            params={
+                "bot": f"eq.{BOT_NAME}",
+                "simbolo": f"eq.{simbolo}",
+                "select": "id,resultados(resultado)",
+                "order": "enviado_en.desc",
+                "limit": 1,
+            },
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        filas = resp.json()
+        if not filas:
+            return False
+        resultados_previos = filas[0].get("resultados") or []
+        if isinstance(resultados_previos, dict):  # embed 1 a 1 llega como objeto
+            resultados_previos = [resultados_previos]
+        estado_actual = resultados_previos[0]["resultado"] if resultados_previos else None
+        return estado_actual in (None, "en_curso")
+    except Exception as exc:
+        print(f"[Aviso] No se pudo revisar si ya había una señal abierta de {simbolo}: {exc}")
+        # Ante la duda, no bloqueamos el guardado (mejor una duplicada
+        # ocasional que perder una señal real por un error de red).
+        return False
+
+
+def guardar_senal_supabase(symbol: str, report, audio_url: Optional[str] = None, verificar_abierta: bool = True) -> None:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         return
     tp = report.trade_plan
     if tp is None:
         # Sin plan de trading accionable (ej. precio en extensión, o sesgo
         # neutral) no hay nada concreto que guardar como señal rastreable.
+        return
+    # verificar_abierta=False solo cuando ya se revisó justo antes.
+    if verificar_abierta and existe_senal_abierta(symbol):
+        print(f"[Aviso] Ya hay una señal abierta de {symbol}, no se guarda una duplicada.")
         return
     direccion = "long" if report.bias == "alcista" else "short"
     entrada = (tp.entry_low + tp.entry_high) / 2
@@ -1224,13 +1269,21 @@ def send_telegram_message(text: str) -> None:
         text = text[:3990] + "\n...(recortado)"
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
+        # No se usa raise_for_status(): ese error incluye la URL con el token
+        # del bot (quedaría expuesto en los Logs) y esconde el motivo real.
+        # Telegram explica el motivo en "description".
         resp = requests.post(url, data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=15)
-        resp.raise_for_status()
         result = resp.json()
+        if not result.get("ok") and "parse entities" in str(result.get("description", "")):
+            # Si algún carácter del reporte rompe el formato HTML, Telegram
+            # rechaza el mensaje entero: se reenvía como texto simple para
+            # que el canal no se quede sin el reporte.
+            resp = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=15)
+            result = resp.json()
         if not result.get("ok"):
-            print(f"[Error Telegram] {result}")
+            print(f"[Error Telegram] {result.get('error_code')} {result.get('description')}")
     except Exception as exc:
-        print(f"[Error enviando a Telegram] {exc}")
+        print(f"[Error enviando a Telegram] {type(exc).__name__}: {str(exc).replace(token, '***')}")
 
 
 # ==============================================================================
@@ -1256,25 +1309,38 @@ def analyze_symbol(symbol: str, interval: str, limit: int, use_ai: bool):
     return text, report
 
 
+def publicar_reporte(symbol: str, text: str, report, use_telegram: bool) -> None:
+    """Manda el reporte (y su audio) a Telegram y guarda la señal en
+    Supabase. Se revisa ANTES si ya hay una señal abierta de este símbolo:
+    si la hay, no se guarda otra ni se sube su audio a Supabase Storage
+    (antes se guardaba una señal y un audio nuevos cada hora aunque fuera
+    la misma operación: duplicaba el historial y llenaba el almacenamiento
+    gratuito). A los clientes en Telegram les sigue llegando todo igual."""
+    if use_telegram:
+        send_telegram_message(text)
+    if report.trade_plan is None:
+        return
+    senal_nueva = not existe_senal_abierta(symbol)
+    audio_url = None
+    print(f"[Audio] {symbol} tiene plan de trading, generando explicación hablada...")
+    audio = generar_audio_explicacion(construir_explicacion_hablada(symbol, report))
+    if audio:
+        if use_telegram:
+            enviar_audio_telegram(audio, symbol)
+        if senal_nueva:
+            audio_url = subir_audio_supabase(audio, symbol)
+    if senal_nueva:
+        guardar_senal_supabase(symbol, report, audio_url, verificar_abierta=False)
+    else:
+        print(f"[Aviso] Ya hay una señal abierta de {symbol}: no se guarda otra ni se sube su audio.")
+
+
 def run_once(symbols: List[str], interval: str, limit: int, use_ai: bool, use_telegram: bool) -> None:
     for symbol in symbols:
         try:
             text, report = analyze_symbol(symbol, interval, limit, use_ai)
             print(text)
-            if use_telegram:
-                send_telegram_message(text)
-
-            audio_url = None
-            if report.trade_plan is not None:
-                print(f"[Audio] {symbol} tiene plan de trading, generando explicación hablada...")
-                texto_hablado = construir_explicacion_hablada(symbol, report)
-                audio = generar_audio_explicacion(texto_hablado)
-                if audio:
-                    if use_telegram:
-                        enviar_audio_telegram(audio, symbol)
-                    audio_url = subir_audio_supabase(audio, symbol)
-
-            guardar_senal_supabase(symbol, report, audio_url)
+            publicar_reporte(symbol, text, report, use_telegram)
         except Exception as exc:
             print(f"[Error analizando {symbol}] {exc}")
     enviar_latido()
